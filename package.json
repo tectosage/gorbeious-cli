@@ -1,0 +1,26 @@
+{
+  "dependencies": {
+    "assert": "^2.0.0",
+    "bcash": "github:badger-cash/bcash#ecash",
+    "bcfg": "^0.1.7",
+    "bcrypto": "^5.4.0",
+    "bcurl": "^0.2.0",
+    "bdb": "^1.4.0",
+    "bdns": "^0.1.5",
+    "bevent": "^0.1.5",
+    "bfile": "^0.2.2",
+    "bfilter": "^1.0.5",
+    "bheep": "^0.1.5",
+    "bignumber.js": "^9.1.1",
+    "binet": "^0.3.7",
+    "blgr": "^0.2.0",
+    "blru": "^0.1.6",
+    "bmutex": "^0.1.6",
+    "bsert": "^0.0.10",
+    "btcp": "^0.1.5",
+    "bufio": "^1.2.0",
+    "bval": "^0.1.6",
+    "chronik-client": "^0.8.1",
+    "n64": "^0.2.10"
+  }
+}
