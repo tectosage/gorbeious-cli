@@ -59,7 +59,7 @@ const keyring = (mnemonic) => {
 }
 
 const getUtxos = async (keyringArray) => {
-    console.log('Getting UTXOs')
+    //console.log('Getting UTXOs')
     let results = [];
     for(let i=0; i<keyringArray.length;i++){
         results[i] = chronik.script("p2pkh", keyringArray[i].getHash("hex")).utxos();
@@ -357,7 +357,7 @@ const simpleCount = (keyringArray, transaction) => {
 }
 
 const getHistory = async (keyringArray) => {
-    console.log('getting history')
+    //console.log('getting history')
     let tokenRecords = _.cloneDeep(tokenRecordStore)
     let array = []
     for(let i =0; i<keyringArray.length; i++){
@@ -712,7 +712,7 @@ const swap = async (transaction, passedHistory) => {
             }
             if(exchangeTX && history.map(x=> x.inputs[0].prevOut.txid).includes(Buffer.from(exchangeTX.inputs[0].prevout.hash.toString('hex'), 'hex').reverse().toString('hex'))){
                 transaction.swap.status = 'Completed!'
-                console.log('Found completed swap')
+                //console.log('Found completed swap')
             }else if(exchangeTX){
                 transaction.swap.baton = Buffer.from(exchangeTX.inputs[0].prevout.hash.toString('hex'), 'hex').reverse().toString('hex')
                 transaction.swap.status = 'pending'
@@ -1394,7 +1394,7 @@ const socket = async () => {
         }
       },
       onReconnect: e => {
-        console.log('Reconnecting Swap websocket')
+        //console.log('Reconnecting Swap websocket')
       }
     })
     websocketStore = swapWS
@@ -1444,7 +1444,7 @@ async function reload(notHistory){
     }
     console.log('reloaded')
     }catch(error){
-        console.log('couldnt reload')
+        //console.log('couldnt reload')
     }
     reloading = false
 }
@@ -1464,14 +1464,14 @@ async function live(){
     let pubkey = keyringStore[12].publicKey.toString('hex')
     
     
-    fetch('https://gorbeious.cash/live/', {method: "POST", headers: {'Content-Type': 'application/json'}, body: JSON.stringify({
+    await fetch('https://gorbeious.cash/live/', {method: "POST", headers: {'Content-Type': 'application/json'}, body: JSON.stringify({
         time: time,
         pubkey: pubkey.toString('hex'),
         message: sign.toString('hex')
     })})
     
     }catch(error){
-        console.log(error)
+       // console.log(error)
     }
     
 
