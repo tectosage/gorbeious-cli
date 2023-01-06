@@ -1030,6 +1030,7 @@ const getPayments = async (signals, history) => {
          tokenRecord = tokenRecordStore[signal.swap.tokenId]
         }catch(error){
             console.log(error, signal)
+            continue
         }
         let decimals = tokenRecord.decimals
         let rate = signal.swap.rate
@@ -1390,7 +1391,7 @@ const socket = async () => {
         if(msg.txid && !arr.includes(msg.txid) && !historyStore.map(a=>a.txid).includes(msg.txid)){
             console.log('waiting')
           await new Promise(resolve => setTimeout(resolve, 1000));
-          try{getPayments(_.cloneDeep(signals), _.cloneDeep(historyStore))}catch{}
+          getPayments(_.cloneDeep(signals), _.cloneDeep(historyStore))
         }
       },
       onReconnect: e => {
