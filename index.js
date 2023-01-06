@@ -1390,7 +1390,7 @@ const socket = async () => {
         if(msg.txid && !arr.includes(msg.txid) && !historyStore.map(a=>a.txid).includes(msg.txid)){
             console.log('waiting')
           await new Promise(resolve => setTimeout(resolve, 1000));
-          getPayments(_.cloneDeep(signals), _.cloneDeep(historyStore))
+          try{getPayments(_.cloneDeep(signals), _.cloneDeep(historyStore))}catch{}
         }
       },
       onReconnect: e => {
