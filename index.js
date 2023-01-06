@@ -1029,7 +1029,7 @@ const getPayments = async (signals, history) => {
         try{
          tokenRecord = tokenRecordStore[signal.swap.tokenId]
         }catch(error){
-            console.log(error, signal)
+            //console.log(error, signal)
             continue
         }
         let decimals = tokenRecord.decimals
