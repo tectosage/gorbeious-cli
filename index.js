@@ -7,6 +7,8 @@ const BigNumber = require('bignumber.js')
 const {U64} = require('n64')
 const {ChronikClient} = require('chronik-client');
 const chronik = new ChronikClient("https://node.gorbeious.cash");
+const {setDefaultResultOrder} = require('dns')
+setDefaultResultOrder("ipv4first");
 
 var mnemonicStore
 var keyringStore
@@ -16,9 +18,10 @@ var tokenCoinStore = {}
 var reservedTokenCoinStore = {}
 var tokenRecordStore = {}
 var historyStore = []
-var signals = []
+var SignalStore = []
 var websocketStore 
 var reloading
+var price
 
 
 try{
@@ -362,6 +365,9 @@ const getHistory = async (keyringArray) => {
     let array = []
     for(let i =0; i<keyringArray.length; i++){
         array.push(chronik.script('p2pkh', keyringArray[i].hash).history(0,200))
+        array.push(chronik.script('p2pkh', keyringArray[i].hash).history(1,200))
+        array.push(chronik.script('p2pkh', keyringArray[i].hash).history(2,200))
+        array.push(chronik.script('p2pkh', keyringArray[i].hash).history(3,200))
     }
     let results = await Promise.all(array)
     let transactions = []
@@ -402,7 +408,7 @@ const getHistory = async (keyringArray) => {
 
         if(transaction.swap){
             if(transaction.swap.type == 'signal'){
-                if(transaction.swap.pointer && !transaction.swap.pointer.outputs[1].spentBy){
+                if(transaction.swap.status == 'Active' && transaction.swap.pointer && !transaction.swap.pointer.outputs[1].spentBy){
                     signals.push(transaction)
                     reservedUTXO.push(transaction.offeredUTXO)
                     reservedUTXO.push({index: 1, hash:Buffer.from(transaction.swap.pointer.txid, 'hex').reverse()})
@@ -472,7 +478,8 @@ const getHistory = async (keyringArray) => {
     reservedCoinStore = reservedCoins
     reservedTokenCoinStore = reservedTokenCoins
     signals.sort((a,b) => a.timeFirstSeen - b.timeFirstSeen)
-    signals = signals.reverse()
+    SignalStore = signals.reverse()
+    // console.log('signals at history', signals.length)
     getPayments(signals, transactions)
     transactions.sort((a,b) => a.timeFirstSeen - b.timeFirstSeen)
     return transactions.reverse()
@@ -588,6 +595,30 @@ const coinFromTX = (tx, index, slp) => {
     return coin
 }
 
+const coinFromChronikTX = (tx, index, slp) => {
+    let hash = Buffer.from(tx.txid, 'hex').reverse()
+    let coin = new Coin({
+        hash: hash,
+        index: index,
+        script: Buffer.from(tx.outputs[index].outputScript, 'hex'),
+        value: parseInt(tx.outputs[index].value)
+    })
+    if(slp){
+        let buffer = Buffer.allocUnsafe(4);
+        buffer.writeUInt32BE(slp.index, 0);
+        let record = SLP.SlpCoinRecord({
+            hash: hash,
+            vout: slp.index,
+            tokenId: Buffer.from(slp.tokenId),
+            tokenIndex: buffer,
+            value: slp.value,
+            type: slp.type
+        })
+        coin.slp = record
+    }
+    return coin
+}
+
 const countSpent = (tx, passedCoins) => {
     let keyringArray = keyringStore
     let arr = []
@@ -659,7 +690,7 @@ const swap = async (transaction, passedHistory) => {
                     }
     
                 }
-                if(script.code.length == 11 && transaction.inputs[0].value == '546'){
+                if((script.code.length == 11 || script.code.length == 12) && transaction.inputs[0].value == '546'){
                     let tokenId = script.code[4].data.toString('hex')
                     transaction.swap = {description: 'Swap Signal 2/2', type: 'signal',
                         tokenId: tokenId, offer: script.code[5].data.toString('ascii'),
@@ -678,6 +709,14 @@ const swap = async (transaction, passedHistory) => {
                             transaction.swap.minimum = '0'
                         }
                     }
+
+                    if(script.code.length == 12){
+                        let peg = script.code[11].data
+                        if(peg[0] != 0){
+                            transaction.swap.peg = peg.toString()
+                        }
+                    }
+
                     transaction.offeredUTXO = {index: script.code[9].data[0], hash: script.code[8].data}
                     if(!passedHistory){
                         await new Promise(resolve => setTimeout(resolve, 500));
@@ -692,7 +731,14 @@ const swap = async (transaction, passedHistory) => {
                             transaction.swap.status = 'Completed!'
                         }
                     }else{
-                        transaction.swap.status = 'Active'
+                        let index = script.code[9].data[0]
+                        let txid = Buffer.from(script.code[8].data.toString('hex'), 'hex').reverse().toString('hex')
+                        let tx = await chronik.tx(txid)
+                        if(tx.outputs[index].spentBy){
+                            transaction.swap.status = 'Cancelled'
+                        }else{
+                            transaction.swap.status = 'Active'
+                        }
                     }
                 }
             
@@ -720,7 +766,7 @@ const swap = async (transaction, passedHistory) => {
                 for(let i=0; i<exchangeTX.inputs.length; i++){
                     let input = exchangeTX.inputs[i]
                     let txid = Buffer.from(input.prevout.hash.toString('hex'), 'hex').reverse().toString('hex')
-                    let tx = await getTransaction(txid)
+                    let tx = await chronik.tx(txid)
                     transaction.swap.inputs.push({hash:input.prevout.hash, index: input.prevout.index, transaction: tx})
 
                     if(tx.outputs[input.prevout.index].spentBy){
@@ -805,7 +851,7 @@ const buildPointerSignalOpReturn = (tokenId, type) => {
     return signalOpReturn.compile();
 }
 
-const buildSignal = (tokenId, type, rate, offeringCoin, minimumSats) => {
+const buildSignal = (tokenId, type, rate, offeringCoin, minimumSats, peg) => {
     const signalOpReturn = new Script()
             .pushSym('return')
             .pushData(Buffer.from('SWP\x00', 'ascii'))
@@ -822,11 +868,16 @@ const buildSignal = (tokenId, type, rate, offeringCoin, minimumSats) => {
             }else{
                 signalOpReturn.pushData(Buffer.from(minimumSats.toString()))
             }
+            if(peg == null){
+                signalOpReturn.pushPush(Buffer.alloc(1, 0))
+            }else{
+                signalOpReturn.pushData(Buffer.from(peg.toString()))
+            }          
 
     return signalOpReturn.compile();
 }
 
-const createOffer = async (tokenId, amount, rate, type, minimum) => {
+const createOffer = async (tokenId, amount, rate, type, minimum, peg) => {
     let keyringArray = keyringStore
     let coins = _.cloneDeep(coinStore)
     let allTokenCoins = _.cloneDeep(tokenCoinStore)
@@ -948,7 +999,8 @@ const createOffer = async (tokenId, amount, rate, type, minimum) => {
     }
    // console.log('Creating Signal')
     let signalTX = new MTX()
-    signalTX.addOutput(buildSignal(tokenId, type, rate*100, offeredUTXO, minimumSats), 0)
+    if(peg){peg = Math.round(price*100000000)}
+    signalTX.addOutput(buildSignal(tokenId, type, rate*100, offeredUTXO, minimumSats, peg), 0)
     await signalTX.fund([pointerCoin, ...coins], {
         inputs: [pointerCoin].map(coin => Input.fromCoin(coin).prevout),
         changeAddress: keyringArray[12].getKeyAddress("string"),
@@ -1079,7 +1131,7 @@ const getPayments = async (signals, history) => {
     
                 if(portion && (!signals[s].swap.minimum || parseInt(signals[s].swap.minimum) > (portion / (10** decimals)))){
                     console.log('Payment marked invalid: Condition Below Minimum')
-                    break
+                    continue
                 }
 
                 let offeringTX = await getTransaction(Buffer.from(signals[s].offeredUTXO.hash.toString('hex'), 'hex').reverse().toString('hex'))
@@ -1105,7 +1157,7 @@ const getPayments = async (signals, history) => {
                 {
                     console.log('Payment marked invalid: Condition 1')
                     valid = false
-                    break
+                    continue
                 }
 
                 for(let i=2;i<inputs.length;i++){
@@ -1113,14 +1165,14 @@ const getPayments = async (signals, history) => {
                     if(keyringArray.map(v=>v.hash).includes(outputScript.slice(6, -4))){
                         console.log('Payment marked invalid: Condition Stealing ')
                         valid = false
-                        break
+                        continue
                     }
                 }
 
                 if((signals[s].swap.fee && portion && transaction.outputs.length < 5 )|| ((signals[s].swap.fee || portion) && transaction.outputs.length < 4) || transaction.outputs.length < 3){
                     console.log('Payment marked invalid: Condition Outputs Missing')
                     valid = false
-                    break
+                    continue
                 }
 
                 if(portion && (outputs[0].script.toRaw().toString('hex') != buildSendOpReturn(signal.swap.tokenId, [portion.toString(), remainder.toString()]).toRaw().toString('hex'))){
@@ -1128,7 +1180,7 @@ const getPayments = async (signals, history) => {
                     //console.log(outputs[0].script.toRaw().toString('hex') == buildSendOpReturn(signal.swap.tokenId, [portion.toString(), remainder.toString()]).toRaw().toString('hex'))
                     console.log('Payment marked invalid: Bad OP_RETURN')
                     valid = false
-                    break
+                    continue
                 }
 
                 if(!portion){
@@ -1137,19 +1189,19 @@ const getPayments = async (signals, history) => {
                         console.log(amountOwedSats)
                         console.log(transaction.outputs[2].value)
                         valid = false
-                        break
+                        continue
                     }
                 }else{
                     if(transaction.outputs[2].script.toRaw().toString('hex') != inputs[0].transaction.outputs[1].outputScript){
                         console.log('Payment marked invalid: Bad Token Change Script')
                         valid = false
-                        break
+                        continue
                     }
                     if(transaction.outputs[3].script.toRaw().toString('hex') != inputs[0].transaction.outputs[1].outputScript || transaction.outputs[3].value != amountOwedSats){
                         console.log(amountOwedSats)
                         console.log('Payment marked invalid: Bring Me My Money, 2')
                         valid = false
-                        break
+                        continue
                     }
                 }
 
@@ -1157,13 +1209,13 @@ const getPayments = async (signals, history) => {
                     if(signals[s].swap.fee && (transaction.outputs[3].script.toRaw().toString('hex') != feeScript || transaction.outputs[3].value != Math.round(new BigNumber(slpTokens).times(rate)))){
                         console.log('Payment marked invalid: Only air is Fee 1 ')
                         valid = false
-                        break
+                        continue
                     }
                 }else{
                     if(signals[s].swap.fee && (transaction.outputs[4].script.toRaw().toString('hex') != feeScript || transaction.outputs[4].value != Math.round(new BigNumber(slpTokens).times(rate)))){
                         console.log('Payment marked invalid: Only air is Fee 2')
                         valid = false
-                        break
+                        continue
                     }
                 }
 
@@ -1202,26 +1254,26 @@ const getPayments = async (signals, history) => {
                 if(inputs.length < 3 || signals[s].inputs[0].prevOut.txid != inputs[0].tx || Buffer.from(inputs[1].tx, 'hex').reverse().toString('hex') != signals[s].offeredUTXO.hash.toString('hex') || transaction.inputs[1].prevout.index != signals[s].offeredUTXO.index){
                     console.log('Payment marked invalid: Condition One')
                     valid = false
-                    break
+                    continue
                 }
                 for(let i=2;i<inputs.length;i++){
                     let outputScript = inputs[i].transaction.outputs[inputs[i].prevout].outputScript
                     if(keyringArray.map(v=>v.hash).includes(outputScript.slice(6, -4))){
                         console.log('Payment marked invalid: Condition Theft ')
                         valid = false
-                        break
+                        continue
                     }
                 }
                 if(!inputs[2].transaction.outputs[inputs[2].prevout].slpToken){
                     console.log('Payment marked invalid: Offered coin not SLP')
                     valid = false
-                    break
+                    continue
                 }
 
                 if(inputs[2].transaction.outputs[inputs[2].prevout].slpToken.amount / (10** tokenRecord.decimals) < signals[s].swap.minimum){
                     console.log('Payment marked invalid: Slp less than minimum ')
                     valid = false
-                    break
+                    continue
                 }
 
                 let tokenAmount = Math.round(new BigNumber(inputs[1].transaction.outputs[signals[s].offeredUTXO.index].value).div(rate).div(100).times(10**decimals))/(10**decimals)
@@ -1244,28 +1296,28 @@ const getPayments = async (signals, history) => {
                     && portion && transaction.outputs.length < 5)){
                     console.log('Payment marked invalid: Condition Lacking Outputs')
                     valid = false
-                    break
+                    continue
                 }
 
                 //verifies opreturn
                 if(sendOpReturn.toString('hex') != transaction.outputs[0].script.toString('hex')){
                     console.log('Payment marked invalid: Condition False OP_RETURN')
                     valid = false
-                    break
+                    continue
                 }
 
                 //verifies amount of token and who they are sent to
                 if(parseInt(inputs[2].transaction.outputs[inputs[2].prevout].slpToken.amount) != tokenSats || transaction.outputs[1].script.toRaw().toString('hex') != inputs[0].transaction.outputs[1].outputScript){
                     console.log('Payment marked invalid: Condition Bad SLP')
                     valid = false
-                    break
+                    continue
                 }
 
                 //if(portion && (transaction.outputs[3].value != remainder * rate * 100 || transaction.outputs[3].script.toRaw().toString('hex') != inputs[0].transaction.outputs[1].outputScript)){
                 if(portion && (transaction.outputs[3].value != Math.round(new BigNumber(remainder).times(rate).times(100))|| transaction.outputs[3].script.toRaw().toString('hex') != inputs[0].transaction.outputs[1].outputScript)){
                     console.log('Payment marked invalid: Lacking XEC change ')
                     valid = false
-                    break
+                    continue
                 }
 
                 if(!portion){
@@ -1273,14 +1325,14 @@ const getPayments = async (signals, history) => {
                         console.log("Payment marked invalid: Condition Bad Fee")
                         console.log(transaction.outputs[3].value, parseInt((tokenAmount * rate * .01 * 100).toFixed(0)))
                         valid = false
-                        break
+                        continue
                     }
                 }else{
                     if(signals[s].swap.fee && (transaction.outputs[4].script.toRaw().toString('hex') != feeScript || transaction.outputs[4].value != parseInt((tokenAmount * rate * .01 * 100).toFixed(0)))){
                         console.log("Payment marked invalid: Condition Bad Fee")
                         console.log(transaction.outputs[3].value, parseInt((tokenAmount * rate * .01 * 100).toFixed(0)))
                         valid = false
-                        break
+                        continue
                     }
                 }
                 
@@ -1326,10 +1378,19 @@ const getPayments = async (signals, history) => {
                 console.log('hash', transaction.hash())
                 let rawTx = Uint8Array.from(transaction.toRaw());
                 try{
+                    let txid = Buffer.from(transaction.hash().toString('hex'), 'hex').reverse().toString('hex')
+                    console.log(txid)
+                    await chronik.tx(txid)
+                    console.log('swap already broadcasted somewhere else')
+                    break
+                }catch{}
+                try{
     
                 let resp = await chronik.broadcastTx(rawTx);
                 console.log('swap transaction', resp)
-                signals = signals.filter(s=>s.txid != signal.txid)
+                SignalStore = _.cloneDeep(SignalStore).filter(s=>s.txid != signal.txid)
+                let script = buildPayment(signal.txid).toRaw().toString('hex')
+                websocketStore.unsubscribe('other', script)
                 if(remainder){
                     if(!reloading){
                     await new Promise(resolve => setTimeout(resolve, 500));
@@ -1337,12 +1398,14 @@ const getPayments = async (signals, history) => {
                     }
                     
                     remainder = remainder / (10** tokenRecord.decimals)
+                    let peg
+                    if(signal.swap.peg){peg=signal.swap.peg}
 
                     try{
                     if(remainder > signal.swap.minimum){
-                        await createOffer(signal.swap.tokenId, remainder, signal.swap.rate, signal.swap.offer, signal.swap.minimum)
+                        await createOffer(signal.swap.tokenId, remainder, signal.swap.rate, signal.swap.offer, signal.swap.minimum, peg)
                     }else{
-                        await createOffer(signal.swap.tokenId, remainder, signal.swap.rate, signal.swap.offer)
+                        await createOffer(signal.swap.tokenId, remainder, signal.swap.rate, signal.swap.offer, peg)
                     }}catch (error){
                         console.log('Failed to relist offer', error)
                     }
@@ -1366,15 +1429,115 @@ const getPayments = async (signals, history) => {
     }
 }
 
+const checkPegs = async (price) => {
+    console.log('checking fiat pegged signals')
+    price = price * 100000000
+    let keyringArray = keyringStore
+    let signals = _.cloneDeep(SignalStore)
+    if(signals.length == 0){console.log('no signals')}
+    let reservedCoins = _.cloneDeep(reservedCoinStore)
+    let coins = _.cloneDeep(coinStore)
+    for(let i=0;i<signals.length;i++){
+        try{
+        let signal = signals[i]
+        let transactions = []
+        if(!signal.swap.peg){
+            continue
+        }
+        if(Math.abs(1 - (signal.swap.peg / price)) < .02){
+            console.log('found pegged trade but not enough price difference to trigger a relist')
+            continue
+        }
+        console.log('large price gap found, relisting')
+        let pointerCoin = coinFromChronikTX(signal.swap.pointer, 1)
+        let pointerTX = new MTX()
+        pointerTX.addOutput(buildPointerSignalOpReturn(signal.swap.tokenId, signal.swap.offer), 0)
+        pointerTX.addOutput(keyringArray[12].getKeyAddress("string"), 546); 
+        pointerTX.addOutput(keyringArray[12].getKeyAddress("string"), 546);
+        await pointerTX.fund([
+            ...[pointerCoin],
+            ...coins
+            ], {
+                inputs: [pointerCoin].map(coin => Input.fromCoin(coin).prevout),
+                changeAddress: keyringArray[10].getKeyAddress("string"),
+                rate: 1000
+        });
+        pointerTX.sign(keyringArray)
+        reservedCoins.push(coinFromTX(pointerTX, 1))
+        let newPointerCoin = coinFromTX(pointerTX, 2)
+        let count = countSpent(pointerTX, coins)
+        coins = count[1]
+        coins = [...coins, ...count[0].filter(c=> c.value !=546)]
+        transactions.push(pointerTX)
+
+        let oldRateSats = signal.swap.rate * 100
+        let ratio = new BigNumber(signal.swap.peg).div(price)
+        let newRateSats = Math.round(ratio.times(oldRateSats))
+        let minimumSats
+        if(signal.swap.minimum){
+            minimumSats = Math.round(new BigNumber(signal.swap.minimum).times(newRateSats))
+        }else{
+            minimumSats = null
+        }
+        let offeredUTXO = signal.offeredUTXO
+        if(signal.swap.offer == "BUY"){
+            let tx = new MTX()
+            let oldCoin = reservedCoins.filter(c => c.hash.toString('hex') == offeredUTXO.hash.toString('hex') && c.index == offeredUTXO.index)[0]
+            coins.push(oldCoin)
+            let sats = Math.round(ratio.times(oldCoin.value))
+            tx.addOutput(keyringArray[10].getKeyAddress("string"), sats)
+            await tx.fund(coins, {
+                rate:1000, 
+                changeAddress: keyringArray[10].getKeyAddress("string")
+            })
+            tx.sign(keyringArray)
+            offeredUTXO = coinFromTX(tx, 0)
+            reservedCoins.push(offeredUTXO)
+            let count = countSpent(tx, coins)
+            coins = [...count[1], ...count[0].filter(c=>c.value!=sats)]
+            transactions.push(tx)
+        }
+        let signalTX = new MTX()
+        signalTX.addOutput(buildSignal(signal.swap.tokenId, signal.swap.offer, newRateSats, offeredUTXO, minimumSats, price), 0)
+        await signalTX.fund([newPointerCoin, ...coins], {
+            inputs: [newPointerCoin].map(coin => Input.fromCoin(coin).prevout),
+            changeAddress: keyringArray[12].getKeyAddress("string"),
+            rate: 1000 // sats/thousand bytes
+        })
+        signalTX.sign(keyringArray)
+        count = countSpent(signalTX, coins)
+        coins = count[1]
+        transactions.push(signalTX)
+        for(let a=0; a<transactions.length;a++){
+            let tx = transactions[a]
+            let rawTx = Uint8Array.from(tx.toRaw())
+            let resp = await chronik.broadcastTx(rawTx)
+            console.log(resp)
+        }
+        SignalStore = _.cloneDeep(SignalStore).filter(s=>s.txid !=signal.txid)
+        let script = buildPayment(Buffer.from(signalTX.hash.toString('hex'),'hex').reverse().toString('hex'))
+        script = script.toRaw().toString('hex')
+        let ws = websocketStore
+        ws.subscribe('other', script)
+        console.log('added new signal to websocket')
+        script = buildPayment(signal.txid).toRaw().toString('hex')
+        ws.unsubscribe('other', script)
+        
+        }catch(error){
+            console.log(error)
+        }
+    }
+    reservedCoinStore = reservedCoins
+}
 const socket = async () => {
     let keyringArray = keyringStore
-    let signalss = _.cloneDeep(signals)
+    let signals = _.cloneDeep(SignalStore)
     let arr = []
     console.log('opening websocket')
     const ws = chronik.ws({
       onMessage: msg => {
         if(msg.txid && !arr.includes(msg.txid )&& !historyStore.map(a=>a.txid).includes(msg.txid)){
-          console.log("Got update: ", msg)
+          //console.log("Got update: ", msg)
           arr.push(msg.txid)
           incoming(msg.txid)
         }
@@ -1390,8 +1553,8 @@ const socket = async () => {
         //console.log(msg)
         if(msg.txid && !arr.includes(msg.txid) && !historyStore.map(a=>a.txid).includes(msg.txid)){
             console.log('waiting')
-          await new Promise(resolve => setTimeout(resolve, 1000));
-          getPayments(_.cloneDeep(signals), _.cloneDeep(historyStore))
+            await new Promise(resolve => setTimeout(resolve, 500));   
+            try{getPayments(_.cloneDeep(SignalStore), _.cloneDeep(historyStore))}catch(error){console.log(error)}
         }
       },
       onReconnect: e => {
@@ -1408,8 +1571,8 @@ const socket = async () => {
 
     await swapWS.waitForOpen()
     console.log('opened swap websocket')
-    for(let i=0; i<signalss.length; i++){
-      let script = buildPayment(signalss[i].txid)
+    for(let i=0; i<signals.length; i++){
+      let script = buildPayment(signals[i].txid)
       script = script.toRaw().toString('hex')
       swapWS.subscribe('other', script)
     }
@@ -1417,14 +1580,14 @@ const socket = async () => {
 }
 
 const incoming = async (txid) => {
-    console.log('incomingg transaction')
+    console.log('incomingg transaction: ', txid)
     let transaction = await chronik.tx(txid)
     transaction = await count(transaction)
     transaction = await swap(transaction)
     
     if(transaction.swap && transaction.swap.type == 'signal'){
     console.log('New Signal Created')
-      signals = [transaction, ...signals]
+      SignalStore = [transaction, ...SignalStore]
       let ws = websocketStore
       ws.waitForOpen()
       let script = buildPayment(transaction.txid)
@@ -1443,7 +1606,7 @@ async function reload(notHistory){
     if(!notHistory){
         historyStore = await getHistory(keyringStore)
     }
-    console.log('reloaded')
+    //console.log('reloaded')
     }catch(error){
         //console.log('couldnt reload')
     }
@@ -1453,7 +1616,7 @@ async function reload(notHistory){
 async function reloadTimer(){
     await new Promise(resolve => setTimeout(resolve, 10000));
     if(!reloading){
-        await reload()
+       try{await reload()}catch(error){console.log(error)}
     }
     reloadTimer()
 }
@@ -1472,7 +1635,7 @@ async function live(){
     })})
     
     }catch(error){
-       // console.log(error)
+     console.log('error posting liveness', error)
     }
     
 
@@ -1481,14 +1644,42 @@ async function live(){
 
 }
 
+async function fetchAsync () {
+    try{
+    let url = 'https://api.coingecko.com/api/v3/simple/price?ids=ecash&vs_currencies=usd'
+    let response = await fetch(url);
+    let data = await response.json();
+    //console.log(data.ecash.usd);
+    price = data.ecash.usd
+    await new Promise(resolve => setTimeout(resolve, 600000));
+    }catch(error){
+        console.log('Error getting $XEC price ', error)
+        await new Promise(resolve => setTimeout(resolve, 6000));
+    }
+    fetchAsync()
+}
+fetchAsync()
+
+async function pegTimer(){
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    while(typeof price != 'number' || reloading){
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    reloading = true
+    await checkPegs(price)
+    reloading = false
+    await new Promise(resolve => setTimeout(resolve, 3600000));
+    pegTimer()
+}
+
 async function main(){
     keyringStore = keyring(mnemonicStore)
-
-    await live()
     await reload()
     var balance = getBalance()
     console.log(`Found a balance of ${balance/100} XEC`)
+    pegTimer()
     socket()
+    live()
     reloadTimer()
 }
 

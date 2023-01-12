@@ -1,4 +1,4 @@
-# gorbeious-cli
+# gorbeious-cli v0.5
 A Node app to keep your Gorbeious offers active
 
 Get Started
